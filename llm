@@ -6,6 +6,13 @@
 ENDPOINT="http://localhost:1234/v1/chat/completions"
 TEMPERATURE=0.2
 
+# ANSI color codes (using $'...' for actual escape chars)
+ORANGE=$'\033[38;5;214m'
+CYAN=$'\033[38;5;51m'
+DIM=$'\033[2m'
+RESET=$'\033[0m'
+BOLD=$'\033[1m'
+
 # Handle model switch flag early (before other processing)
 if [[ "$1" == "-m" || "$1" == "--model" ]]; then
   echo "Switching model..."
@@ -19,6 +26,28 @@ if [[ "$1" == "-k" || "$1" == "--kill" ]]; then
   echo "Stopping LM Studio server..."
   lms unload --all
   lms server stop
+  exit 0
+fi
+
+# Handle context length flag
+if [[ "$1" == "-l" || "$1" == "--context" ]]; then
+  if [[ ! "${2:-}" =~ ^[0-9]+$ ]]; then
+    echo "Error: -l requires a numeric context length (e.g., llm -l 8192)"
+    exit 1
+  fi
+  CONTEXT_LENGTH="$2"
+  
+  # Get current model from lms ps
+  CURRENT_MODEL=$(lms ps 2>/dev/null | tail -n +2 | awk '{print $2}' | head -1)
+  
+  if [ -z "$CURRENT_MODEL" ]; then
+    echo "Error: No model currently loaded. Load a model first with: llm -m"
+    exit 1
+  fi
+  
+  echo "Reloading $CURRENT_MODEL with context length: $CONTEXT_LENGTH"
+  lms unload --all
+  lms load "$CURRENT_MODEL" --context-length "$CONTEXT_LENGTH"
   exit 0
 fi
 
@@ -62,6 +91,9 @@ QUESTION=""
 CMD_QUERY=""
 FILE_PATH=""
 WEB_SEARCH=""
+THINK_STEPS=""
+DEBUG=""
+AGENT_LOOPS=""
 
 while [[ "$1" =~ ^- ]]; do
   case "$1" in
@@ -80,12 +112,27 @@ while [[ "$1" =~ ^- ]]; do
     FILE_PATH="$1"
     ;;
   -w | --web)
-    # Check if next arg is a number (source count) or another flag/empty
+    WEB_SEARCH="true"
+    ;;
+  -t | --think)
+    # Check if next arg is a number (step count) or another flag/empty
     if [[ "${2:-}" =~ ^[0-9]+$ ]]; then
       shift
-      WEB_SEARCH="$1"
+      THINK_STEPS="$1"
     else
-      WEB_SEARCH="3"  # Default to 3 results
+      THINK_STEPS="2"  # Default to 2 thinking steps
+    fi
+    ;;
+  -d | --debug)
+    DEBUG="true"
+    ;;
+  -a | --agent)
+    # Check if next arg is a number (max iterations) or another flag/empty
+    if [[ "${2:-}" =~ ^[0-9]+$ ]]; then
+      shift
+      AGENT_LOOPS="$1"
+    else
+      AGENT_LOOPS="5"  # Default to 5 iterations
     fi
     ;;
   -h | --help)
@@ -99,21 +146,28 @@ Modes:
   llm -q 'your question'           → Pure question (no command)
   llm -c 'list files by size'      → Get the exact shell command
   llm -o file.txt                  → Analyze a file's contents
-  llm -o file.py -q 'what does this do?' → Ask about a file
-  llm -w -q 'what is kubernetes?'  → Web search (3 results default)
-  llm -w 5 -q 'latest rust news'   → Web search with 5 results
+  llm -o file.py -q 'what does this do?' → Ask about a file (agentic)
+  llm -w -q 'what is kubernetes?'  → AI-driven web search
+  llm -t -q 'complex question'     → Multi-step thinking (default: 2 steps)
+  llm -t 4 -q 'hard problem'       → Thinking with 4 refinement steps
+  llm -a -q 'what does this code do?' → Agent mode (explores files)
   llm -m                           → Switch loaded model
   llm -k                           → Stop LM Studio server
+  llm -l 8192                      → Reload model with 8192 context length
 
 Options:
   -s, --short     Short summary (default)
   -v, --verbose   Detailed analysis
   -q, --question  Follow-up question or standalone query
   -c, --command   Get the shell command for a task
-  -o, --open      Analyze a file's contents
-  -w, --web [n]   Web search via ddgr (default: 3 results)
+  -o, --open      Analyze a file's contents (agentic with tools)
+  -w, --web       AI-driven web search (AI formulates queries)
+  -t, --think [n] Multi-step thinking with self-critique (default: 2 steps)
+  -a, --agent [n] Agent mode with tool use (default: 5 iterations)
+  -d, --debug     Show all LLM responses and debug info
   -m, --model     Switch the loaded model
   -k, --kill      Stop the LM Studio server
+  -l, --context   Reload model with specified context length
   -h, --help      Show this help
 EOF
     exit 0
@@ -136,7 +190,276 @@ else
   STYLE_INSTRUCTION="Be concise - respond in 2-4 sentences focusing only on key points."
 fi
 
-# Handle web search mode (-w) - requires a question
+# File analysis tools prompt (for -o mode)
+FILE_ANALYSIS_PROMPT='You are analyzing a specific file. Use these tools to explore it:
+
+TOOLS:
+- READ_ALL - Read entire file (if small enough)
+- READ <start>-<end> - Read specific line range (e.g., READ 1-50)
+- SYMBOLS - List all functions/classes in this file
+- EXTRACT_FUNC <function_name> - Extract a complete function by name
+
+FORMAT: Respond with ONLY:
+TOOL: <command>
+
+Examples:
+TOOL: SYMBOLS
+TOOL: READ 100-150  
+TOOL: EXTRACT_FUNC loadData
+TOOL: READ_ALL
+
+When ready to answer, respond normally without TOOL: prefix.'
+
+# Helper function to call LLM with specific temperature
+call_llm() {
+  local system_prompt="$1"
+  local user_message="$2"
+  local temp="${3:-$TEMPERATURE}"
+  
+  local temp_json=$(mktemp)
+  
+  jq -n \
+    --arg model "$MODEL" \
+    --arg system "$system_prompt" \
+    --arg user "$user_message" \
+    --argjson temp "$temp" \
+    '{
+      model: $model,
+      messages: [
+        {role: "system", content: $system},
+        {role: "user", content: $user}
+      ],
+      temperature: $temp,
+      max_tokens: 1024,
+      stream: false
+    }' >"$temp_json"
+  
+  local response=$(curl -s "$ENDPOINT" \
+    -H "Content-Type: application/json" \
+    -d @"$temp_json")
+  
+  rm "$temp_json"
+  
+  # Debug: show raw response
+  if [ -n "$DEBUG" ]; then
+    echo -e "${DIM}─── DEBUG: Raw API Response ───${RESET}" >&2
+    echo "$response" | jq . 2>/dev/null || echo "$response" >&2
+    echo -e "${DIM}───────────────────────────────${RESET}" >&2
+  fi
+  
+  # Extract content
+  local content=$(echo "$response" | jq -r '.choices[0].message.content // empty' 2>/dev/null)
+  
+  # Detect and truncate repetition loops
+  if [ -n "$content" ]; then
+    # Check for repeated phrases (same sentence appearing 3+ times)
+    local first_sentence=$(echo "$content" | head -c 100 | grep -oE "^[^.!?]+[.!?]" | head -1)
+    if [ -n "$first_sentence" ]; then
+      local repeat_count=$(echo "$content" | grep -oF "$first_sentence" | wc -l)
+      if [ "$repeat_count" -ge 3 ]; then
+        # Truncate at first repetition
+        content=$(echo "$content" | awk -v pat="$first_sentence" '
+          BEGIN { count=0 }
+          { 
+            if (index($0, pat) > 0) count++
+            if (count >= 2) { print "[Response truncated - repetition detected]"; exit }
+            print
+          }
+        ')
+      fi
+    fi
+    # Also hard limit on response length
+    if [ ${#content} -gt 4000 ]; then
+      content="${content:0:4000}
+
+[Response truncated - exceeded 4000 chars]"
+    fi
+  fi
+  
+  # Check for errors or empty response
+  if [ -z "$content" ]; then
+    if [ -n "$DEBUG" ]; then
+      echo -e "${ORANGE}DEBUG: No content extracted from response${RESET}" >&2
+    fi
+    local error=$(echo "$response" | jq -r '.error.message // empty' 2>/dev/null)
+    if [ -n "$error" ]; then
+      echo -e "${ORANGE}API Error: $error${RESET}" >&2
+    fi
+  elif [ -n "$DEBUG" ]; then
+    echo -e "${DIM}─── DEBUG: Extracted Content ───${RESET}" >&2
+    echo "$content" >&2
+    echo -e "${DIM}────────────────────────────────${RESET}" >&2
+  fi
+  
+  echo "$content"
+}
+
+# Execute an agent tool safely
+execute_tool() {
+  local tool_call="$1"
+  local result=""
+  
+  local tool_name=$(echo "$tool_call" | awk '{print $1}')
+  local tool_args=$(echo "$tool_call" | cut -d' ' -f2-)
+  
+  case "$tool_name" in
+    TREE)
+      result=$(tree -L 2 -I 'node_modules|__pycache__|.git|venv|*.pyc' 2>/dev/null || find . -maxdepth 2 -type f | head -50)
+      ;;
+    LS_FILES)
+      result=$(git ls-files 2>/dev/null || find . -type f -name '*.py' -o -name '*.js' -o -name '*.sh' -o -name '*.md' | head -50)
+      ;;
+    READ)
+      local file=$(echo "$tool_args" | cut -d: -f1)
+      local range=$(echo "$tool_args" | cut -d: -f2)
+      local start=$(echo "$range" | cut -d- -f1)
+      local end=$(echo "$range" | cut -d- -f2)
+      if [[ ! -f "$file" ]]; then
+        result="Error: File not found: $file"
+      elif [[ ! "$file" =~ ^[a-zA-Z0-9_./-]+$ ]]; then
+        result="Error: Invalid file path"
+      else
+        result=$(sed -n "${start},${end}p" "$file" 2>/dev/null || echo "Error reading file")
+      fi
+      ;;
+    COUNT)
+      local file="$tool_args"
+      if [[ -f "$file" ]]; then
+        result=$(wc -l < "$file" 2>/dev/null)
+        result="$file has $result lines"
+      else
+        result="Error: File not found: $file"
+      fi
+      ;;
+    FILE_TYPE)
+      local file="$tool_args"
+      if [[ -f "$file" ]]; then
+        result=$(file -b "$file" 2>/dev/null)
+      else
+        result="Error: File not found: $file"
+      fi
+      ;;
+    SYMBOLS)
+      local file="$tool_args"
+      if [[ ! -f "$file" ]]; then
+        result="Error: File not found: $file"
+      elif command -v ctags &>/dev/null; then
+        result=$(ctags -x --sort=no "$file" 2>/dev/null | head -50)
+      else
+        result=$(grep -n "^def \|^class \|^async def \|function \|const \|export " "$file" 2>/dev/null | head -30 || echo "No symbols found")
+      fi
+      ;;
+    DIFF)
+      result=$(git diff --no-color 2>/dev/null | head -100 || echo "Not a git repository or no changes")
+      ;;
+    EXTRACT_FUNC)
+      local file=$(echo "$tool_args" | cut -d: -f1)
+      local func_name=$(echo "$tool_args" | cut -d: -f2)
+      if [[ ! -f "$file" ]]; then
+        result="Error: File not found: $file"
+      elif [ -z "$func_name" ]; then
+        result="Error: Function name required. Format: EXTRACT_FUNC file:function_name"
+      else
+        if command -v ctags &>/dev/null; then
+          local line_num=$(ctags -x "$file" 2>/dev/null | grep -w "$func_name" | awk '{print $3}' | head -1)
+          if [ -n "$line_num" ]; then
+            local next_func=$(ctags -x "$file" 2>/dev/null | awk -v start="$line_num" '$3 > start {print $3; exit}')
+            local end_line=${next_func:-$((line_num + 100))}
+            [ $((end_line - line_num)) -gt 150 ] && end_line=$((line_num + 150))
+            result=$(sed -n "${line_num},${end_line}p" "$file" 2>/dev/null)
+          else
+            result="Function '$func_name' not found in $file"
+          fi
+        else
+          local line_num=$(grep -n "$func_name" "$file" 2>/dev/null | head -1 | cut -d: -f1)
+          if [ -n "$line_num" ]; then
+            result=$(sed -n "${line_num},$((line_num + 100))p" "$file" 2>/dev/null)
+          else
+            result="Function '$func_name' not found in $file"
+          fi
+        fi
+      fi
+      ;;
+    READ_ALL)
+      local file="$tool_args"
+      if [[ -f "$file" ]]; then
+        local line_count=$(wc -l < "$file")
+        if [ "$line_count" -gt 500 ]; then
+          result="Warning: File has $line_count lines. Showing first 500:
+$(head -500 "$file")"
+        else
+          result=$(cat "$file")
+        fi
+      else
+        result="Error: File not found: $file"
+      fi
+      ;;
+    WEB_SEARCH)
+      # Search the web using ddgr
+      local query="$tool_args"
+      if [ -z "$query" ]; then
+        result="Error: Search query required. Format: WEB_SEARCH your search terms"
+      elif ! command -v ddgr &>/dev/null; then
+        result="Error: ddgr is required for web search. Install with: sudo pacman -S ddgr"
+      else
+        # Search with ddgr, get 3 results in JSON format
+        local search_output=$(ddgr --json -n 3 "$query" 2>/dev/null)
+        if [ -n "$search_output" ]; then
+          # Format results nicely
+          result=$(echo "$search_output" | jq -r '.[] | "[\(.n)] \(.title)\nURL: \(.url)\n\(.abstract)\n"' 2>/dev/null)
+          if [ -z "$result" ]; then
+            result="No results found for: $query"
+          fi
+        else
+          result="No results found for: $query"
+        fi
+      fi
+      ;;
+    *)
+      result="Error: Unknown tool: $tool_name"
+      ;;
+  esac
+  
+  echo "$result"
+}
+
+# Render markdown with orange text and syntax-highlighted code blocks
+render_output() {
+  local in_code_block=false
+  local code_lang=""
+  local code_buffer=""
+  
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" =~ ^\`\`\`(.*)$ ]]; then
+      if $in_code_block; then
+        if command -v bat &>/dev/null && [[ -n "$code_lang" ]]; then
+          echo "$code_buffer" | bat -l "$code_lang" --style=plain --color=always 2>/dev/null || echo "$code_buffer"
+        elif command -v pygmentize &>/dev/null && [[ -n "$code_lang" ]]; then
+          echo "$code_buffer" | pygmentize -l "$code_lang" 2>/dev/null || echo "$code_buffer"
+        else
+          echo "$code_buffer"
+        fi
+        in_code_block=false
+        code_buffer=""
+        code_lang=""
+      else
+        in_code_block=true
+        code_lang="${BASH_REMATCH[1]}"
+      fi
+    elif $in_code_block; then
+      code_buffer+="$line"$'\n'
+    else
+      if [[ "$line" =~ ^#+ ]]; then
+        echo -e "${BOLD}${ORANGE}${line}${RESET}"
+      else
+        formatted=$(echo "$line" | sed -E "s/\*\*([^*]+)\*\*/${BOLD}${CYAN}\1${RESET}${ORANGE}/g")
+        echo -e "${ORANGE}${formatted}${RESET}"
+      fi
+    fi
+  done
+}
+
+# Handle web search mode (-w) - agentic search
 if [ -n "$WEB_SEARCH" ]; then
   if [ -z "$QUESTION" ]; then
     echo "Error: Web search (-w) requires a question (-q)."
@@ -148,26 +471,81 @@ if [ -n "$WEB_SEARCH" ]; then
     exit 1
   fi
   
-  echo "Searching: $QUESTION"
+  echo "Question: $QUESTION"
   echo "────────────────────────────────────"
+  echo -e "${DIM}Web search mode: AI will search as needed...${RESET}"
+  echo ""
   
-  # Get search results as JSON, then format them
-  SEARCH_JSON=$(ddgr -n "$WEB_SEARCH" --json "$QUESTION" 2>/dev/null)
+  WEB_AGENT_SYSTEM="You are a helpful research assistant with web search capability. $STYLE_INSTRUCTION
+
+You have access to this tool:
+- WEB_SEARCH <query> - Search the web for information
+
+To search, respond with ONLY:
+TOOL: WEB_SEARCH your search query here
+
+When you have enough information, provide your final answer (no TOOL: prefix)."
   
-  if [ -z "$SEARCH_JSON" ] || [ "$SEARCH_JSON" = "[]" ]; then
-    echo "No search results found."
-    SEARCH_CONTEXT=""
-  else
-    # Format results: [n] Title - URL \n    Snippet
-    SEARCH_CONTEXT=$(echo "$SEARCH_JSON" | jq -r 'to_entries | .[] | "[\(.key + 1)] \(.value.title)\n    \(.value.url)\n    \(.value.abstract)\n"')
-    echo "$SEARCH_CONTEXT"
-  fi
+  WEB_CONTEXT="User question: $QUESTION
+
+Use WEB_SEARCH to find relevant information, then answer the question."
   
+  # Agent loop for web search (max 3 searches)
+  for ((iter=1; iter<=3; iter++)); do
+    RESPONSE=$(call_llm "$WEB_AGENT_SYSTEM" "$WEB_CONTEXT" "$TEMPERATURE")
+    
+    if [ -z "$RESPONSE" ]; then
+      echo "${ORANGE}Error: No response from LLM${RESET}"
+      exit 1
+    fi
+    
+    # Check for tool call
+    TOOL_CALL=""
+    if [[ "$RESPONSE" == *"TOOL:"* ]]; then
+      TOOL_CALL=$(echo "$RESPONSE" | grep -oE "TOOL: WEB_SEARCH .+" | head -1 | sed 's/^TOOL: //')
+    fi
+    
+    # Fallback: check for bare WEB_SEARCH
+    if [ -z "$TOOL_CALL" ]; then
+      if [[ "$RESPONSE" == WEB_SEARCH* ]]; then
+        TOOL_CALL="$RESPONSE"
+      fi
+    fi
+    
+    if [ -n "$TOOL_CALL" ]; then
+      SEARCH_QUERY=$(echo "$TOOL_CALL" | sed 's/^WEB_SEARCH //')
+      echo -e "${CYAN}[SEARCH]${RESET} $SEARCH_QUERY"
+      
+      TOOL_RESULT=$(execute_tool "WEB_SEARCH $SEARCH_QUERY")
+      
+      WEB_CONTEXT="$WEB_CONTEXT
+
+Search: $SEARCH_QUERY
+Results:
+$TOOL_RESULT
+
+Continue searching or provide your final answer."
+    else
+      # Final answer
+      echo ""
+      echo "────────────────────────────────────"
+      echo ""
+      echo "$RESPONSE" | render_output
+      exit 0
+    fi
+  done
+  
+  # Max iterations - force answer
+  echo -e "${DIM}(max searches reached)${RESET}"
+  FINAL_PROMPT="$WEB_CONTEXT
+
+Provide your final answer now based on the search results."
+  RESPONSE=$(call_llm "$WEB_AGENT_SYSTEM" "$FINAL_PROMPT" "$TEMPERATURE")
+  echo ""
   echo "────────────────────────────────────"
-  echo "Asking LLM..."
-  
-  SYSTEM_PROMPT="You are a helpful assistant. Use the following web search results to answer the user's question accurately. Cite sources by number when relevant. $STYLE_INSTRUCTION"
-  USER_MESSAGE="Search Results:\n$SEARCH_CONTEXT\n\nQuestion: $QUESTION"
+  echo ""
+  echo "$RESPONSE" | render_output
+  exit 0
 
 # Determine what to do and build prompt dynamically
 elif [ -z "$COMMAND" ] && [ -z "$QUESTION" ] && [ -z "$CMD_QUERY" ] && [ -z "$FILE_PATH" ]; then
@@ -190,24 +568,128 @@ elif [ -n "$FILE_PATH" ]; then
   fi
   
   FILE_NAME=$(basename "$FILE_PATH")
-  FILE_CONTENTS=$(cat "$FILE_PATH")
+  FILE_LINES=$(wc -l < "$FILE_PATH")
+  FILE_SYMBOLS=$(ctags -x "$FILE_PATH" 2>/dev/null | head -20 || grep -n "def \|class \|function " "$FILE_PATH" 2>/dev/null | head -20 || echo "No symbols found")
   
-  # Handle empty files
-  if [ -z "$FILE_CONTENTS" ]; then
-    FILE_CONTENTS="[FILE IS EMPTY - no contents]"
-  fi
-  
-  echo "Analyzing: $FILE_PATH"
+  echo "Analyzing: $FILE_PATH ($FILE_LINES lines)"
   echo "────────────────────────────────────"
   
   if [ -n "$QUESTION" ]; then
-    # File + question mode
-    SYSTEM_PROMPT="You are a helpful programming and file analysis assistant. You are given the name and contents of a file. Answer the user's question about this file. $STYLE_INSTRUCTION"
-    USER_MESSAGE="Filename: $FILE_NAME\n\nContents:\n$FILE_CONTENTS\n\nQuestion: $QUESTION"
+    # Agentic file analysis mode
+    echo -e "${DIM}File analysis mode: use tools to explore...${RESET}"
+    echo ""
+    
+    FILE_AGENT_SYSTEM="You are a code analysis expert. You are analyzing: $FILE_NAME ($FILE_LINES lines)
+
+$FILE_ANALYSIS_PROMPT
+
+$STYLE_INSTRUCTION"
+    
+    FILE_CONTEXT="File: $FILE_NAME ($FILE_LINES lines)
+Symbols in file:
+$FILE_SYMBOLS
+
+User question: $QUESTION
+
+Use the tools above to explore the file and answer the question."
+    
+    # Agent loop for file analysis (max 5 iterations)
+    for ((iter=1; iter<=5; iter++)); do
+      RESPONSE=$(call_llm "$FILE_AGENT_SYSTEM" "$FILE_CONTEXT" "$TEMPERATURE")
+      
+      if [ -z "$RESPONSE" ]; then
+        echo "${ORANGE}Error: No response from LLM${RESET}"
+        exit 1
+      fi
+      
+      # Check for tool calls
+      TOOL_CALL=""
+      if [[ "$RESPONSE" == *"TOOL:"* ]]; then
+        TOOL_CALL=$(echo "$RESPONSE" | grep -oE "TOOL: .+" | head -1 | sed 's/^TOOL: //')
+      fi
+      
+      # Fallback: check for bare tool names
+      if [ -z "$TOOL_CALL" ]; then
+        FIRST_WORD=$(echo "$RESPONSE" | awk '{print $1}')
+        case "$FIRST_WORD" in
+          READ_ALL|SYMBOLS)
+            TOOL_CALL="$FIRST_WORD $FILE_PATH"
+            ;;
+          READ)
+            # Extract range and add file path
+            RANGE=$(echo "$RESPONSE" | grep -oE "[0-9]+-[0-9]+" | head -1)
+            [ -n "$RANGE" ] && TOOL_CALL="READ $FILE_PATH:$RANGE"
+            ;;
+          EXTRACT_FUNC)
+            FUNC_NAME=$(echo "$RESPONSE" | awk '{print $2}')
+            [ -n "$FUNC_NAME" ] && TOOL_CALL="EXTRACT_FUNC $FILE_PATH:$FUNC_NAME"
+            ;;
+        esac
+      else
+        # Add file path to file-relative tools if not present
+        case "$TOOL_CALL" in
+          READ_ALL|SYMBOLS)
+            [[ "$TOOL_CALL" != *"$FILE_PATH"* ]] && TOOL_CALL="$TOOL_CALL $FILE_PATH"
+            ;;
+          READ\ *)
+            [[ "$TOOL_CALL" != *":"* ]] && TOOL_CALL=$(echo "$TOOL_CALL" | sed "s/READ /READ $FILE_PATH:/")
+            ;;
+          EXTRACT_FUNC\ *)
+            [[ "$TOOL_CALL" != *":"* ]] && TOOL_CALL=$(echo "$TOOL_CALL" | sed "s/EXTRACT_FUNC /EXTRACT_FUNC $FILE_PATH:/")
+            ;;
+        esac
+      fi
+      
+      if [ -n "$TOOL_CALL" ]; then
+        echo -e "${CYAN}[TOOL]${RESET} $TOOL_CALL"
+        TOOL_RESULT=$(execute_tool "$TOOL_CALL")
+        
+        # Truncate long results
+        if [ ${#TOOL_RESULT} -gt 4000 ]; then
+          TOOL_RESULT="${TOOL_RESULT:0:4000}
+... (truncated)"
+        fi
+        
+        FILE_CONTEXT="$FILE_CONTEXT
+
+Tool: $TOOL_CALL
+Result:
+$TOOL_RESULT
+
+Continue exploring or provide your final answer."
+      else
+        # Final answer
+        echo ""
+        echo "────────────────────────────────────"
+        echo ""
+        echo "$RESPONSE" | render_output
+        exit 0
+      fi
+    done
+    
+    # Max iterations - force answer
+    echo -e "${DIM}(max iterations reached)${RESET}"
+    FINAL_PROMPT="$FILE_CONTEXT
+
+Provide your final answer now."
+    RESPONSE=$(call_llm "$FILE_AGENT_SYSTEM" "$FINAL_PROMPT" "$TEMPERATURE")
+    echo ""
+    echo "────────────────────────────────────"
+    echo ""
+    echo "$RESPONSE" | render_output
+    exit 0
+    
   else
-    # File only mode - explain the file
+    # No question - just explain the file (read it all)
+    FILE_CONTENTS=$(cat "$FILE_PATH")
+    if [ -z "$FILE_CONTENTS" ]; then
+      FILE_CONTENTS="[FILE IS EMPTY - no contents]"
+    fi
     SYSTEM_PROMPT="You are a helpful programming and file analysis assistant. Explain what this file does, its purpose, and if relevant, the file type and how it functions. $STYLE_INSTRUCTION"
-    USER_MESSAGE="Filename: $FILE_NAME\n\nContents:\n$FILE_CONTENTS"
+    USER_MESSAGE="Filename: $FILE_NAME
+
+Contents:
+$FILE_CONTENTS"
   fi
   echo "Asking LLM..."
 
@@ -273,35 +755,250 @@ else
   echo "Asking LLM..."
 fi
 
-# Build and send request safely
-TEMP_JSON=$(mktemp)
-
-jq -n \
-  --arg model "$MODEL" \
-  --arg system "$SYSTEM_PROMPT" \
-  --arg user "$USER_MESSAGE" \
-  '{
-    model: $model,
-    messages: [
-      {role: "system", content: $system},
-      {role: "user", content: $user}
-    ],
-    temperature: '"$TEMPERATURE"',
-    max_tokens: 1024,
-    stream: false
-  }' >"$TEMP_JSON"
-
-RESPONSE=$(curl -s "$ENDPOINT" \
-  -H "Content-Type: application/json" \
-  -d @"$TEMP_JSON")
-
-rm "$TEMP_JSON"
-
 # ANSI color codes (using $'...' for actual escape chars)
 ORANGE=$'\033[38;5;214m'
 CYAN=$'\033[38;5;51m'
+DIM=$'\033[2m'
 RESET=$'\033[0m'
 BOLD=$'\033[1m'
+
+# Critique prompts for thinking chain (rotate through these)
+CRITIQUE_PROMPTS=(
+  "As a critical reviewer, examine the previous response for weaknesses, gaps, missing information, or potential errors. Be specific about what could be improved."
+  "As a domain expert, what important nuances, edge cases, or technical details were overlooked in this response? What would an expert add?"
+  "As someone learning this topic, what parts of this response are unclear, too brief, or need more explanation? What questions remain unanswered?"
+)
+
+# Agent system prompt with tool descriptions
+AGENT_TOOLS_PROMPT='You have access to read-only tools for exploring the codebase.
+
+TOOLS:
+- TREE - View directory structure
+- LS_FILES - List source files  
+- READ file:start-end - Read lines from file (e.g., READ src/main.py:1-50)
+- COUNT file - Get line count
+- FILE_TYPE file - Check if text/binary
+- SYMBOLS file - List functions/classes
+- DIFF - Show git changes
+- EXTRACT_FUNC file:function_name - Extract complete function by name
+- READ_ALL file - Read entire file contents
+
+FORMAT - CRITICAL:
+To call a tool, your ENTIRE response must be exactly:
+TOOL: <command>
+
+Examples of CORRECT format:
+TOOL: TREE
+TOOL: READ README.md:1-30
+TOOL: EXTRACT_FUNC utils.cpp:processData
+
+WRONG (do not do this):
+"Let me check the files" TOOL: TREE
+TREE
+READ file.txt
+
+When done exploring, respond with your answer (no TOOL: prefix).'
+
+# File analysis tools prompt (for -o mode)
+FILE_ANALYSIS_PROMPT='You are analyzing a specific file. Use these tools to explore it:
+
+TOOLS:
+- READ_ALL - Read entire file (if small enough)
+- READ <start>-<end> - Read specific line range (e.g., READ 1-50)
+- SYMBOLS - List all functions/classes in this file
+- EXTRACT_FUNC <function_name> - Extract a complete function by name
+
+FORMAT: Respond with ONLY:
+TOOL: <command>
+
+Examples:
+TOOL: SYMBOLS
+TOOL: READ 100-150  
+TOOL: EXTRACT_FUNC loadData
+TOOL: READ_ALL
+
+When ready to answer, respond normally without TOOL: prefix.'
+
+# Execute an agent tool safely
+execute_tool() {
+  local tool_call="$1"
+  local result=""
+  
+  # Parse tool name and args
+  local tool_name=$(echo "$tool_call" | awk '{print $1}')
+  local tool_args=$(echo "$tool_call" | cut -d' ' -f2-)
+  
+  case "$tool_name" in
+    TREE)
+      result=$(tree -L 2 -I 'node_modules|__pycache__|.git|venv|*.pyc' 2>/dev/null || find . -maxdepth 2 -type f | head -50)
+      ;;
+    LS_FILES)
+      result=$(git ls-files 2>/dev/null || find . -type f -name '*.py' -o -name '*.js' -o -name '*.sh' -o -name '*.md' | head -50)
+      ;;
+    READ)
+      # Parse file:start-end format
+      local file=$(echo "$tool_args" | cut -d: -f1)
+      local range=$(echo "$tool_args" | cut -d: -f2)
+      local start=$(echo "$range" | cut -d- -f1)
+      local end=$(echo "$range" | cut -d- -f2)
+      
+      # Safety checks
+      if [[ ! -f "$file" ]]; then
+        result="Error: File not found: $file"
+      elif [[ ! "$file" =~ ^[a-zA-Z0-9_./-]+$ ]]; then
+        result="Error: Invalid file path"
+      else
+        result=$(sed -n "${start},${end}p" "$file" 2>/dev/null || echo "Error reading file")
+      fi
+      ;;
+    COUNT)
+      local file="$tool_args"
+      if [[ -f "$file" ]]; then
+        result=$(wc -l < "$file" 2>/dev/null)
+        result="$file has $result lines"
+      else
+        result="Error: File not found: $file"
+      fi
+      ;;
+    FILE_TYPE)
+      local file="$tool_args"
+      if [[ -f "$file" ]]; then
+        result=$(file -b "$file" 2>/dev/null)
+      else
+        result="Error: File not found: $file"
+      fi
+      ;;
+    SYMBOLS)
+      local file="$tool_args"
+      if [[ ! -f "$file" ]]; then
+        result="Error: File not found: $file"
+      elif command -v ctags &>/dev/null; then
+        result=$(ctags -x --sort=no "$file" 2>/dev/null | head -50)
+      else
+        # Fallback: grep for function/class definitions
+        result=$(grep -n "^def \|^class \|^async def \|function \|const \|export " "$file" 2>/dev/null | head -30 || echo "No symbols found")
+      fi
+      ;;
+    DIFF)
+      result=$(git diff --no-color 2>/dev/null | head -100 || echo "Not a git repository or no changes")
+      ;;
+    EXTRACT_FUNC)
+      # Extract a function by name from a file
+      # Format: EXTRACT_FUNC file:function_name
+      local file=$(echo "$tool_args" | cut -d: -f1)
+      local func_name=$(echo "$tool_args" | cut -d: -f2)
+      
+      if [[ ! -f "$file" ]]; then
+        result="Error: File not found: $file"
+      elif [ -z "$func_name" ]; then
+        result="Error: Function name required. Format: EXTRACT_FUNC file:function_name"
+      else
+        # Try to find function using ctags
+        if command -v ctags &>/dev/null; then
+          local line_num=$(ctags -x "$file" 2>/dev/null | grep -w "$func_name" | awk '{print $3}' | head -1)
+          if [ -n "$line_num" ]; then
+            # Find the end of the function (next function or +100 lines, whichever is first)
+            local next_func=$(ctags -x "$file" 2>/dev/null | awk -v start="$line_num" '$3 > start {print $3; exit}')
+            local end_line=${next_func:-$((line_num + 100))}
+            # Don't exceed 150 lines
+            [ $((end_line - line_num)) -gt 150 ] && end_line=$((line_num + 150))
+            result=$(sed -n "${line_num},${end_line}p" "$file" 2>/dev/null)
+          else
+            result="Function '$func_name' not found in $file"
+          fi
+        else
+          # Fallback: grep for function name and extract surrounding context
+          local line_num=$(grep -n "$func_name" "$file" 2>/dev/null | head -1 | cut -d: -f1)
+          if [ -n "$line_num" ]; then
+            # Extract 100 lines starting from function
+            result=$(sed -n "${line_num},$((line_num + 100))p" "$file" 2>/dev/null)
+          else
+            result="Function '$func_name' not found in $file"
+          fi
+        fi
+      fi
+      ;;
+    READ_ALL)
+      # Read entire file (with limit)
+      local file="$tool_args"
+      if [[ -f "$file" ]]; then
+        local line_count=$(wc -l < "$file")
+        if [ "$line_count" -gt 500 ]; then
+          result="Warning: File has $line_count lines. Showing first 500:
+$(head -500 "$file")"
+        else
+          result=$(cat "$file")
+        fi
+      else
+        result="Error: File not found: $file"
+      fi
+      ;;
+    *)
+      result="Error: Unknown tool: $tool_name"
+      ;;
+  esac
+  
+  echo "$result"
+}
+
+# Helper function to call LLM with specific temperature
+call_llm() {
+  local system_prompt="$1"
+  local user_message="$2"
+  local temp="${3:-$TEMPERATURE}"
+  
+  local temp_json=$(mktemp)
+  
+  jq -n \
+    --arg model "$MODEL" \
+    --arg system "$system_prompt" \
+    --arg user "$user_message" \
+    --argjson temp "$temp" \
+    '{
+      model: $model,
+      messages: [
+        {role: "system", content: $system},
+        {role: "user", content: $user}
+      ],
+      temperature: $temp,
+      max_tokens: 2048,
+      stream: false
+    }' >"$temp_json"
+  
+  local response=$(curl -s "$ENDPOINT" \
+    -H "Content-Type: application/json" \
+    -d @"$temp_json")
+  
+  rm "$temp_json"
+  
+  # Debug: show raw response
+  if [ -n "$DEBUG" ]; then
+    echo -e "${DIM}─── DEBUG: Raw API Response ───${RESET}" >&2
+    echo "$response" | jq . 2>/dev/null || echo "$response" >&2
+    echo -e "${DIM}───────────────────────────────${RESET}" >&2
+  fi
+  
+  # Extract content
+  local content=$(echo "$response" | jq -r '.choices[0].message.content // empty' 2>/dev/null)
+  
+  # Check for errors or empty response
+  if [ -z "$content" ]; then
+    if [ -n "$DEBUG" ]; then
+      echo -e "${ORANGE}DEBUG: No content extracted from response${RESET}" >&2
+    fi
+    # Check if there's an error in the response
+    local error=$(echo "$response" | jq -r '.error.message // empty' 2>/dev/null)
+    if [ -n "$error" ]; then
+      echo -e "${ORANGE}API Error: $error${RESET}" >&2
+    fi
+  elif [ -n "$DEBUG" ]; then
+    echo -e "${DIM}─── DEBUG: Extracted Content ───${RESET}" >&2
+    echo "$content" >&2
+    echo -e "${DIM}────────────────────────────────${RESET}" >&2
+  fi
+  
+  echo "$content"
+}
 
 # Render markdown with orange text and syntax-highlighted code blocks
 render_output() {
@@ -345,14 +1042,203 @@ render_output() {
   done
 }
 
-# Output response
-if echo "$RESPONSE" | jq -e '.choices[0].message.content' >/dev/null 2>&1; then
+# Execute thinking chain or single request
+if [ -n "$THINK_STEPS" ]; then
+  # Multi-step thinking mode
+  TOTAL_STEPS=$((THINK_STEPS + 1))  # +1 for final synthesis
+  
+  echo "────────────────────────────────────"
+  
+  # Step 1: Initial draft
+  if [ -n "$DEBUG" ]; then
+    echo -e "${DIM}── Step 1/$TOTAL_STEPS: Initial Draft ──${RESET}"
+  else
+    printf "${DIM}Thinking... (step 1/%d)${RESET}\r" "$TOTAL_STEPS"
+  fi
+  CURRENT_RESPONSE=$(call_llm "$SYSTEM_PROMPT" "$USER_MESSAGE" "0.2")
+  
+  if [ -z "$CURRENT_RESPONSE" ]; then
+    echo ""
+    echo "${ORANGE}Error: No response from initial draft${RESET}"
+    exit 1
+  fi
+  
+  # Show debug output for initial draft
+  if [ -n "$DEBUG" ]; then
+    echo ""
+    echo "$CURRENT_RESPONSE"
+    echo ""
+  fi
+  
+  # Critique and refine steps
+  for ((i=1; i<=THINK_STEPS; i++)); do
+    STEP=$((i + 1))
+    
+    # Select critique prompt (rotate through them)
+    CRITIQUE_INDEX=$(( (i - 1) % ${#CRITIQUE_PROMPTS[@]} ))
+    CRITIQUE_PROMPT="${CRITIQUE_PROMPTS[$CRITIQUE_INDEX]}"
+    
+    if [ "$i" -lt "$THINK_STEPS" ]; then
+      # Intermediate step: critique and improve
+      if [ -n "$DEBUG" ]; then
+        echo -e "${DIM}── Step $STEP/$TOTAL_STEPS: Critique & Refine ──${RESET}"
+      else
+        printf "${DIM}Thinking... (step %d/%d)${RESET}\r" "$STEP" "$TOTAL_STEPS"
+      fi
+      
+      COMBINED_MESSAGE="Original question: $USER_MESSAGE
+
+Previous response:
+$CURRENT_RESPONSE
+
+$CRITIQUE_PROMPT
+
+Then provide an improved response that addresses these issues."
+      
+      CURRENT_RESPONSE=$(call_llm "$SYSTEM_PROMPT" "$COMBINED_MESSAGE" "0.5")
+    else
+      # Final step: synthesize with lower temperature for coherence
+      if [ -n "$DEBUG" ]; then
+        echo -e "${DIM}── Step $STEP/$TOTAL_STEPS: Final Synthesis ──${RESET}"
+      else
+        printf "${DIM}Thinking... (step %d/%d)${RESET}\r" "$STEP" "$TOTAL_STEPS"
+      fi
+      
+      COMBINED_MESSAGE="Original question: $USER_MESSAGE
+
+Previous response:
+$CURRENT_RESPONSE
+
+Review this response one final time. Provide a polished, comprehensive final answer that is accurate and well-organized."
+      
+      CURRENT_RESPONSE=$(call_llm "$SYSTEM_PROMPT" "$COMBINED_MESSAGE" "0.3")
+    fi
+    
+    if [ -z "$CURRENT_RESPONSE" ]; then
+      echo ""
+      echo "${ORANGE}Error: No response at step $STEP${RESET}"
+      exit 1
+    fi
+    
+    # Show debug output for this step
+    if [ -n "$DEBUG" ]; then
+      echo ""
+      echo "$CURRENT_RESPONSE"
+      echo ""
+    fi
+  done
+  
+  # Clear the thinking line and show result
+  if [ -z "$DEBUG" ]; then
+    printf "\r\033[K"
+  fi
+  echo "────────────────────────────────────"
+  echo -e "${BOLD}Final Answer:${RESET}"
+  echo ""
+  echo "$CURRENT_RESPONSE" | render_output
+
+# Agent mode with tool use
+elif [ -n "$AGENT_LOOPS" ]; then
+  # Build agent system prompt
+  AGENT_SYSTEM_PROMPT="$SYSTEM_PROMPT
+
+$AGENT_TOOLS_PROMPT"
+  
+  echo "────────────────────────────────────"
+  echo -e "${DIM}Agent mode: exploring codebase...${RESET}"
+  echo ""
+  
+  # Build conversation context
+  AGENT_CONTEXT="User question: $USER_MESSAGE"
+  
+  for ((iter=1; iter<=AGENT_LOOPS; iter++)); do
+    # Call LLM with current context
+    RESPONSE=$(call_llm "$AGENT_SYSTEM_PROMPT" "$AGENT_CONTEXT" "$TEMPERATURE")
+    
+    if [ -z "$RESPONSE" ]; then
+      echo "${ORANGE}Error: No response from agent${RESET}"
+      exit 1
+    fi
+    
+    # Try to extract tool call - check for TOOL: prefix first
+    TOOL_CALL=""
+    if [[ "$RESPONSE" == *"TOOL:"* ]]; then
+      TOOL_CALL=$(echo "$RESPONSE" | grep -oE "TOOL: .+" | head -1 | sed 's/^TOOL: //')
+    fi
+    
+    # Fallback: check if response is a bare tool command (model didn't follow format)
+    if [ -z "$TOOL_CALL" ]; then
+      # Trim whitespace and check if it matches a known tool pattern
+      TRIMMED=$(echo "$RESPONSE" | tr -d '[:space:]' | head -c 100)
+      FIRST_WORD=$(echo "$RESPONSE" | awk '{print $1}')
+      
+      case "$FIRST_WORD" in
+        TREE|LS_FILES|DIFF)
+          TOOL_CALL="$FIRST_WORD"
+          ;;
+        READ|COUNT|FILE_TYPE|SYMBOLS)
+          # These need arguments - extract the whole line
+          TOOL_CALL=$(echo "$RESPONSE" | grep -oE "^(READ|COUNT|FILE_TYPE|SYMBOLS) .+" | head -1)
+          ;;
+      esac
+    fi
+    
+    # If we found a tool call, execute it
+    if [ -n "$TOOL_CALL" ]; then
+      # Display tool being used
+      echo -e "${CYAN}[TOOL]${RESET} $TOOL_CALL"
+      
+      # Execute the tool
+      TOOL_RESULT=$(execute_tool "$TOOL_CALL")
+      
+      # Truncate very long results
+      if [ ${#TOOL_RESULT} -gt 3000 ]; then
+        TOOL_RESULT="${TOOL_RESULT:0:3000}
+... (truncated)"
+      fi
+      
+      # Add to context for next iteration
+      AGENT_CONTEXT="$AGENT_CONTEXT
+
+Tool call: $TOOL_CALL
+Tool result:
+$TOOL_RESULT
+
+Continue exploring with another TOOL: command, or provide your final answer."
+      
+    else
+      # Not a tool call - this is the final answer
+      echo ""
+      echo "────────────────────────────────────"
+      echo ""
+      echo "$RESPONSE" | render_output
+      exit 0
+    fi
+  done
+  
+  # Max iterations reached - ask for final answer
+  echo ""
+  echo -e "${DIM}(max iterations reached, requesting final answer...)${RESET}"
+  FINAL_PROMPT="$AGENT_CONTEXT
+
+You have used all available tool iterations. Please provide your final answer now based on what you have learned."
+  
+  RESPONSE=$(call_llm "$AGENT_SYSTEM_PROMPT" "$FINAL_PROMPT" "$TEMPERATURE")
+  echo ""
   echo "────────────────────────────────────"
   echo ""
-  echo "$RESPONSE" | jq -r '.choices[0].message.content' | render_output
+  echo "$RESPONSE" | render_output
+
 else
-  echo "Error: Invalid response from LLM"
-  echo ""
-  echo "$RESPONSE" | jq .
-  exit 1
+  # Standard single request
+  RESPONSE=$(call_llm "$SYSTEM_PROMPT" "$USER_MESSAGE" "$TEMPERATURE")
+  
+  if [ -n "$RESPONSE" ]; then
+    echo "────────────────────────────────────"
+    echo ""
+    echo "$RESPONSE" | render_output
+  else
+    echo "Error: Invalid response from LLM"
+    exit 1
+  fi
 fi
