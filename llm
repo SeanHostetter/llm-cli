@@ -1,0 +1,358 @@
+#!/usr/bin/env bash
+
+# llm - Local LLM helper: analyze command output or answer questions
+# Requires: curl, jq, lms (LM Studio CLI)
+
+ENDPOINT="http://localhost:1234/v1/chat/completions"
+TEMPERATURE=0.2
+
+# Handle model switch flag early (before other processing)
+if [[ "$1" == "-m" || "$1" == "--model" ]]; then
+  echo "Switching model..."
+  lms unload --all
+  lms load
+  exit 0
+fi
+
+# Handle kill server flag
+if [[ "$1" == "-k" || "$1" == "--kill" ]]; then
+  echo "Stopping LM Studio server..."
+  lms unload --all
+  lms server stop
+  exit 0
+fi
+
+# Check if LM Studio server is running
+SERVER_CHECK=$(curl -s http://localhost:1234/v1/models 2>/dev/null)
+
+if [ -z "$SERVER_CHECK" ]; then
+  echo "LM Studio server not running. Starting..."
+  lms server start
+  sleep 2  # Give server time to start
+fi
+
+# Get loaded models
+MODELS_RESPONSE=$(curl -s http://localhost:1234/v1/models 2>/dev/null || echo '{"data":[]}')
+MODEL_IDS=$(echo "$MODELS_RESPONSE" | jq -r '.data[].id' 2>/dev/null || echo "")
+MODEL_COUNT=$(echo "$MODEL_IDS" | grep -v '^$' | wc -l)
+
+# If no model loaded, prompt user to select one
+if [ "$MODEL_COUNT" -eq 0 ]; then
+  echo "No model loaded. Please select a model:"
+  lms unload --all 2>/dev/null
+  lms load
+  # Re-check after loading
+  MODELS_RESPONSE=$(curl -s http://localhost:1234/v1/models 2>/dev/null || echo '{"data":[]}')
+  MODEL_IDS=$(echo "$MODELS_RESPONSE" | jq -r '.data[].id' 2>/dev/null || echo "")
+  MODEL_COUNT=$(echo "$MODEL_IDS" | grep -v '^$' | wc -l)
+  
+  if [ "$MODEL_COUNT" -eq 0 ]; then
+    echo "Error: No model selected. Exiting."
+    exit 1
+  fi
+fi
+
+MODEL=$(echo "$MODEL_IDS" | head -n1)
+echo "Using model: $MODEL"
+echo "────────────────────────────────────"
+
+# Flags
+MODE="short"
+QUESTION=""
+CMD_QUERY=""
+FILE_PATH=""
+WEB_SEARCH=""
+
+while [[ "$1" =~ ^- ]]; do
+  case "$1" in
+  -s | --short) MODE="short" ;;
+  -v | --verbose) MODE="verbose" ;;
+  -q | --question)
+    shift
+    QUESTION="$1"
+    ;;
+  -c | --command)
+    shift
+    CMD_QUERY="$1"
+    ;;
+  -o | --open)
+    shift
+    FILE_PATH="$1"
+    ;;
+  -w | --web)
+    # Check if next arg is a number (source count) or another flag/empty
+    if [[ "${2:-}" =~ ^[0-9]+$ ]]; then
+      shift
+      WEB_SEARCH="$1"
+    else
+      WEB_SEARCH="3"  # Default to 3 results
+    fi
+    ;;
+  -h | --help)
+    cat <<EOF
+Usage: llm [options] ['command'] [-q 'question']
+
+Modes:
+  llm 'command'                    → Analyze command output (short by default)
+  llm -v 'command'                 → Detailed analysis
+  llm 'command' -q 'your question' → Analyze output and answer specific question
+  llm -q 'your question'           → Pure question (no command)
+  llm -c 'list files by size'      → Get the exact shell command
+  llm -o file.txt                  → Analyze a file's contents
+  llm -o file.py -q 'what does this do?' → Ask about a file
+  llm -w -q 'what is kubernetes?'  → Web search (3 results default)
+  llm -w 5 -q 'latest rust news'   → Web search with 5 results
+  llm -m                           → Switch loaded model
+  llm -k                           → Stop LM Studio server
+
+Options:
+  -s, --short     Short summary (default)
+  -v, --verbose   Detailed analysis
+  -q, --question  Follow-up question or standalone query
+  -c, --command   Get the shell command for a task
+  -o, --open      Analyze a file's contents
+  -w, --web [n]   Web search via ddgr (default: 3 results)
+  -m, --model     Switch the loaded model
+  -k, --kill      Stop the LM Studio server
+  -h, --help      Show this help
+EOF
+    exit 0
+    ;;
+  *)
+    echo "Unknown option: $1"
+    exit 1
+    ;;
+  esac
+  shift
+done
+
+# Remaining argument: optional command
+COMMAND="$1"
+
+# Build style instruction based on mode
+if [ "$MODE" = "verbose" ]; then
+  STYLE_INSTRUCTION="Provide a detailed, comprehensive answer. Explain concepts thoroughly, interpret all important values, highlight any warnings/errors, and suggest next steps if relevant."
+else
+  STYLE_INSTRUCTION="Be concise - respond in 2-4 sentences focusing only on key points."
+fi
+
+# Handle web search mode (-w) - requires a question
+if [ -n "$WEB_SEARCH" ]; then
+  if [ -z "$QUESTION" ]; then
+    echo "Error: Web search (-w) requires a question (-q)."
+    exit 1
+  fi
+  
+  if ! command -v ddgr &>/dev/null; then
+    echo "Error: ddgr is required for web search. Install with: sudo pacman -S ddgr"
+    exit 1
+  fi
+  
+  echo "Searching: $QUESTION"
+  echo "────────────────────────────────────"
+  
+  # Get search results as JSON, then format them
+  SEARCH_JSON=$(ddgr -n "$WEB_SEARCH" --json "$QUESTION" 2>/dev/null)
+  
+  if [ -z "$SEARCH_JSON" ] || [ "$SEARCH_JSON" = "[]" ]; then
+    echo "No search results found."
+    SEARCH_CONTEXT=""
+  else
+    # Format results: [n] Title - URL \n    Snippet
+    SEARCH_CONTEXT=$(echo "$SEARCH_JSON" | jq -r 'to_entries | .[] | "[\(.key + 1)] \(.value.title)\n    \(.value.url)\n    \(.value.abstract)\n"')
+    echo "$SEARCH_CONTEXT"
+  fi
+  
+  echo "────────────────────────────────────"
+  echo "Asking LLM..."
+  
+  SYSTEM_PROMPT="You are a helpful assistant. Use the following web search results to answer the user's question accurately. Cite sources by number when relevant. $STYLE_INSTRUCTION"
+  USER_MESSAGE="Search Results:\n$SEARCH_CONTEXT\n\nQuestion: $QUESTION"
+
+# Determine what to do and build prompt dynamically
+elif [ -z "$COMMAND" ] && [ -z "$QUESTION" ] && [ -z "$CMD_QUERY" ] && [ -z "$FILE_PATH" ]; then
+  echo "Error: Provide a command, question (-q), command query (-c), or file (-o)."
+  exit 1
+
+# Handle command query mode (-c) with optimized prompt
+elif [ -n "$CMD_QUERY" ]; then
+  SYSTEM_PROMPT="You are a Linux command expert. Respond with ONLY the exact shell command in a bash code block. No explanation, no alternatives, just the single best command. If multiple commands are needed, chain them appropriately."
+  USER_MESSAGE="$CMD_QUERY"
+  echo "Command for: $CMD_QUERY"
+  echo "────────────────────────────────────"
+  echo "Asking LLM..."
+
+# Handle file analysis mode (-o)
+elif [ -n "$FILE_PATH" ]; then
+  if [ ! -f "$FILE_PATH" ]; then
+    echo "Error: File not found: $FILE_PATH"
+    exit 1
+  fi
+  
+  FILE_NAME=$(basename "$FILE_PATH")
+  FILE_CONTENTS=$(cat "$FILE_PATH")
+  
+  # Handle empty files
+  if [ -z "$FILE_CONTENTS" ]; then
+    FILE_CONTENTS="[FILE IS EMPTY - no contents]"
+  fi
+  
+  echo "Analyzing: $FILE_PATH"
+  echo "────────────────────────────────────"
+  
+  if [ -n "$QUESTION" ]; then
+    # File + question mode
+    SYSTEM_PROMPT="You are a helpful programming and file analysis assistant. You are given the name and contents of a file. Answer the user's question about this file. $STYLE_INSTRUCTION"
+    USER_MESSAGE="Filename: $FILE_NAME\n\nContents:\n$FILE_CONTENTS\n\nQuestion: $QUESTION"
+  else
+    # File only mode - explain the file
+    SYSTEM_PROMPT="You are a helpful programming and file analysis assistant. Explain what this file does, its purpose, and if relevant, the file type and how it functions. $STYLE_INSTRUCTION"
+    USER_MESSAGE="Filename: $FILE_NAME\n\nContents:\n$FILE_CONTENTS"
+  fi
+  echo "Asking LLM..."
+
+else
+  # Normal mode - build prompt with style instruction
+  SYSTEM_PROMPT="You are a helpful Linux system administrator assistant. $STYLE_INSTRUCTION"
+  USER_MESSAGE=""
+
+  # If we have a command, run it and add output to context
+  if [ -n "$COMMAND" ]; then
+    echo "Running: $COMMAND"
+    echo "────────────────────────────────────"
+    OUTPUT=$(eval "$COMMAND" 2>&1)
+    EXIT_CODE=$?
+
+    [ $EXIT_CODE -ne 0 ] && OUTPUT="$OUTPUT\n\n[Command exited with code $EXIT_CODE]"
+
+    echo "$OUTPUT"
+    echo "────────────────────────────────────"
+    
+    USER_MESSAGE="Command: $COMMAND\n\nOutput:\n$OUTPUT"
+    
+    # Auto-detect script files in the command and include their contents
+    SCRIPT_CONTENTS=""
+    SCRIPT_FILE=""
+    
+    # Check for known interpreters/compilers or ./ execution
+    case "$COMMAND" in
+      python*|python3*|node*|bash*|sh*|zsh*|ruby*|perl*|php*|lua*|gcc*|g++*|clang*|rustc*|cargo\ run*|go\ run*|java*|javac*|./*|./*)
+        # Extract potential file arguments
+        for word in $COMMAND; do
+          # Skip the interpreter itself and flags
+          if [[ "$word" =~ ^\./.*$ ]] || [[ "$word" =~ \.(py|js|ts|sh|bash|rb|pl|php|lua|c|cpp|cc|h|hpp|rs|go|java)$ ]]; then
+            if [ -f "$word" ]; then
+              SCRIPT_FILE="$word"
+              SCRIPT_CONTENTS=$(cat "$word" 2>/dev/null)
+              break
+            fi
+          fi
+        done
+        ;;
+    esac
+    
+    if [ -n "$SCRIPT_CONTENTS" ]; then
+      echo "Including script: $SCRIPT_FILE"
+      USER_MESSAGE="$USER_MESSAGE\n\n--- Script Contents ($SCRIPT_FILE) ---\n$SCRIPT_CONTENTS"
+    fi
+  fi
+
+  # If we have a question, add it
+  if [ -n "$QUESTION" ]; then
+    if [ -n "$USER_MESSAGE" ]; then
+      # Command + question: append question to context
+      USER_MESSAGE="$USER_MESSAGE\n\nQuestion: $QUESTION"
+    else
+      # Question only
+      echo "Question: $QUESTION"
+      echo "────────────────────────────────────"
+      USER_MESSAGE="$QUESTION"
+    fi
+  fi
+
+  echo "Asking LLM..."
+fi
+
+# Build and send request safely
+TEMP_JSON=$(mktemp)
+
+jq -n \
+  --arg model "$MODEL" \
+  --arg system "$SYSTEM_PROMPT" \
+  --arg user "$USER_MESSAGE" \
+  '{
+    model: $model,
+    messages: [
+      {role: "system", content: $system},
+      {role: "user", content: $user}
+    ],
+    temperature: '"$TEMPERATURE"',
+    max_tokens: 1024,
+    stream: false
+  }' >"$TEMP_JSON"
+
+RESPONSE=$(curl -s "$ENDPOINT" \
+  -H "Content-Type: application/json" \
+  -d @"$TEMP_JSON")
+
+rm "$TEMP_JSON"
+
+# ANSI color codes (using $'...' for actual escape chars)
+ORANGE=$'\033[38;5;214m'
+CYAN=$'\033[38;5;51m'
+RESET=$'\033[0m'
+BOLD=$'\033[1m'
+
+# Render markdown with orange text and syntax-highlighted code blocks
+render_output() {
+  local in_code_block=false
+  local code_lang=""
+  local code_buffer=""
+  
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    # Check for code block start/end
+    if [[ "$line" =~ ^\`\`\`(.*)$ ]]; then
+      if $in_code_block; then
+        # End of code block - render it
+        if command -v bat &>/dev/null && [[ -n "$code_lang" ]]; then
+          echo "$code_buffer" | bat -l "$code_lang" --style=plain --color=always 2>/dev/null || echo "$code_buffer"
+        elif command -v pygmentize &>/dev/null && [[ -n "$code_lang" ]]; then
+          echo "$code_buffer" | pygmentize -l "$code_lang" 2>/dev/null || echo "$code_buffer"
+        else
+          echo "$code_buffer"
+        fi
+        in_code_block=false
+        code_buffer=""
+        code_lang=""
+      else
+        # Start of code block
+        in_code_block=true
+        code_lang="${BASH_REMATCH[1]}"
+      fi
+    elif $in_code_block; then
+      # Inside code block - buffer it
+      code_buffer+="$line"$'\n'
+    else
+      # Regular text - make it orange, bold headers, **bold** in cyan
+      if [[ "$line" =~ ^#+ ]]; then
+        echo -e "${BOLD}${ORANGE}${line}${RESET}"
+      else
+        # Replace **text** with cyan bold
+        formatted=$(echo "$line" | sed -E "s/\*\*([^*]+)\*\*/${BOLD}${CYAN}\1${RESET}${ORANGE}/g")
+        echo -e "${ORANGE}${formatted}${RESET}"
+      fi
+    fi
+  done
+}
+
+# Output response
+if echo "$RESPONSE" | jq -e '.choices[0].message.content' >/dev/null 2>&1; then
+  echo "────────────────────────────────────"
+  echo ""
+  echo "$RESPONSE" | jq -r '.choices[0].message.content' | render_output
+else
+  echo "Error: Invalid response from LLM"
+  echo ""
+  echo "$RESPONSE" | jq .
+  exit 1
+fi
